@@ -9,15 +9,15 @@ const int   httpPort    = 443;
 const char* bearer      = "<redacted>";                 // Home Assistant bearer authentication string.
 const char* url         = "/api/states/sensor.garage_door_status";
                                                         // URL to HA device to update
-const char fingerprint[] PROGMEM = "01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10 11 12 13 FF";
-                                                        // HTTPS cert fingerprint for HA server
 
 const char* username    = "username";                   // Username to authenticate call to trigger open
 const char* password    = "password";                   // ... and password.
+
+const char* host_name   = "garage_door_opener";
+const char* ota_pwd     = "<redacted>";
 // End Config
 
 #define ESP8266_LED 2                                   // LED on board
-#define SENSOR_PIN D8
 #define RELAY_PIN D7
 #define BUZZER_PIN D0
 #define POLLING_INTERVAL 1000                           // 1 sec = 1000 milliseconds
@@ -26,11 +26,26 @@ const char* password    = "password";                   // ... and password.
 #define DELAY_AFTER_CLOSING 15000                       // > time it takes for door to close
 #define DELAY_FOR_HTTP_RESPONSE 150                     // Prevent 499 return code
 
-unsigned long currtime;
+#define ECHOPIN D2 // HC-SR04 Echo pin
+#define TRIGPIN D3 // HC-SR04 Trig pin
+
+int minimum = 30;
+int maximum = 40;
+
+unsigned long last_poll = 0;
 int last_status = 1;
 long int last_post = 0 - DELAY_BETWEEN_POST;
 int currstatus = 1;
+int door_closing = 0;
+int closing = 0;
+int buzz_high = 0;
+unsigned long closing_start = 0;
+unsigned long buzz_start = 0;
 
+long duration; // variable for the duration of sound wave travel
+int distance;  // variable for the distance measurement
+
+#include <ArduinoOTA.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <WiFiClientSecure.h>
@@ -39,7 +54,6 @@ ESP8266WebServer server(80);
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
   Serial.print("Connecting to ");
   Serial.println(ssid);
   WiFi.mode(WIFI_STA);                                  // Disable AP mode
@@ -48,13 +62,16 @@ void setup() {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("");
-  Serial.println("WiFi connected");                     // Display WiFi info to serial
+  Serial.println("\nWiFi connected");                     // Display WiFi info to serial
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
+
   pinMode(ESP8266_LED, OUTPUT);                         // Allow us to control the LED on the ESP8266
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(TRIGPIN, OUTPUT);
+  pinMode(ECHOPIN, INPUT);
+
   update_status(1);                                     // POST an initial status to Home Assistant
   last_post = 0 - DELAY_BETWEEN_POST;                   // Reset last POST time
 
@@ -63,6 +80,14 @@ void setup() {
   });
   server.on("/status", slash_status);
   server.begin();                                       // Start HTTP server
+
+  ArduinoOTA.setHostname(host_name);
+  ArduinoOTA.setPassword(ota_pwd);
+  ArduinoOTA.onStart([]() {});
+  ArduinoOTA.onEnd([]() {});
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {});
+  ArduinoOTA.onError([](ota_error_t error) {});
+  ArduinoOTA.begin();
 }
 
 void slash_status() {
@@ -70,28 +95,29 @@ void slash_status() {
     server.requestAuthentication();
   }else{
     Serial.println("Authenticated connection to /status");
-    if(currstatus == 0) {
+    if(get_current_status() == 0) {
       Serial.println("closing door");
       digitalWrite(RELAY_PIN, HIGH);
       delay(500);
       digitalWrite(RELAY_PIN, LOW);
+      last_poll = millis() + 2000;
       last_status = 1;
     }else{
       Serial.println("opening door");
       digitalWrite(RELAY_PIN, HIGH);
       delay(500);
       digitalWrite(RELAY_PIN, LOW);
-      last_status = 0;
+      last_poll = millis() + 15000;
+      last_status = currstatus = 0;
     }
   }
   server.send(200, "text/plain", String(last_status));
-  delay(DELAY_AFTER_CLOSING);
   post_status(last_status);
 }
 
 void post_status(int current_status) {
   WiFiClientSecure client;
-  client.setFingerprint(fingerprint);
+  client.setInsecure();
   if (!client.connect(host, httpPort)) {                // connect to Home Assistant
     Serial.println("https connection failed");
     return;
@@ -126,60 +152,97 @@ void post_status(int current_status) {
   }
 }
 
-
-void initiate_close() {
-  for (int i=0; i<15; i++) {                            // Make some noise for 30 seconds
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(1000);
-    server.handleClient();                              // Respond to HTTP requests
-    digitalWrite(BUZZER_PIN, LOW);
-    currstatus=digitalRead(SENSOR_PIN);                 // Check to see if door was manually closed
-    if(currstatus == 1) {
-      last_status = 1;
-      return;                                           // If so exit
-    }
-    delay(1000);
-    server.handleClient();                              // Respond to HTTP requests
-  }
-  
-  Serial.println("closing door");
-  digitalWrite(RELAY_PIN, HIGH);
-  delay(500);
-  digitalWrite(RELAY_PIN, LOW);
-  delay(DELAY_AFTER_CLOSING);
-  last_status = 2;
-  post_status(last_status);
-}
-
 void update_status(int current_status) {                // Action function
-  if( current_status != last_status) {
-    post_status(current_status);                        // POST all changes
-  }
- if(current_status == last_status) {
-    if (current_status == 0) {
-      if(millis() < last_post + DELAY_BEFORE_CLOSE) {
-        Serial.println("Not closing due to close delay");
-      }else{
-        initiate_close();
+  Serial.println(current_status);
+  if(current_status != last_status) {
+    // confirm it is by checking again
+    delay(100);
+    currstatus=current_status=get_current_status();
+    if(current_status != last_status) {
+      // confirm it is by checking again
+      delay(100);
+      currstatus=current_status=get_current_status();
+      if( current_status != last_status) {
+        post_status(current_status);                        // POST all changes
       }
     }
+  } else if (current_status == 0) {
+    if(millis() < last_post + DELAY_BEFORE_CLOSE) {
+      Serial.println("Not closing due to close delay");
+    } else if (!closing) {
+      closing_start = buzz_start = millis();
+      closing = 1;
+    }
   }
-}
-void loop() {                                           // Main loop
-  digitalWrite(ESP8266_LED, LOW);
-  delay(POLLING_INTERVAL/2);
-  server.handleClient();                                // Respond to HTTP requests
-  if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(ESP8266_LED, HIGH);                    // Blink the LED if the WiFi is connected
-  }
-  delay(POLLING_INTERVAL/2);
-  server.handleClient();                                // Respond to HTTP requests
-  currtime=millis();
-  currstatus=digitalRead(SENSOR_PIN);                   // Grab the status from the sensor
-  Serial.print(currtime);
-  Serial.print(" ");
-  Serial.println(currstatus);
-  update_status(currstatus);                            // Run POST function
-  server.handleClient();                                // Respond to HTTP requests
 }
 
+void loop() {                                           // Main loop
+  if(millis() > last_poll + POLLING_INTERVAL) {
+    if (WiFi.status() == WL_CONNECTED) {
+      digitalWrite(ESP8266_LED, HIGH);                    // Blink the LED if the WiFi is connected
+    }
+    currstatus=get_current_status();
+    last_poll=millis();
+  } else if (millis() > last_poll + (POLLING_INTERVAL/2)) {
+    digitalWrite(ESP8266_LED, LOW);
+  }
+  update_status(currstatus);                            // Run POST function
+  server.handleClient();                                // Respond to HTTP requests
+  ArduinoOTA.handle();
+  if (closing) {
+    Serial.println("in closing");
+    process_closing();
+  }
+}
+
+int get_current_status() {
+  digitalWrite(TRIGPIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIGPIN, HIGH); // Sets the trigPin HIGH (ACTIVE) for 10 microseconds
+  delayMicroseconds(10);
+  digitalWrite(TRIGPIN, LOW);
+  duration = pulseIn(ECHOPIN, HIGH); // Reads the echoPin, returns the sound wave travel time in microseconds
+  distance = duration * 0.034 / 2; // Speed of sound wave divided by 2 (go and back)
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+  if(distance > maximum) { // closed
+    return 1;
+  } else if(distance > minimum) { // open
+    return 0;
+  }
+  return currstatus; // somthing blocking, like a spider, just assume no change
+}
+
+void process_closing() {
+  if (door_closing) {                                   // Door actively closing
+    if (millis() > closing_start + DELAY_AFTER_CLOSING) {
+      closing = door_closing = 0;                       // All done closing
+    }
+  } else if (millis() > closing_start + 30000) {        // Done buzzing, start the close
+    buzz_high = 0;
+    digitalWrite(BUZZER_PIN, LOW);
+    Serial.println("closing door");
+    digitalWrite(RELAY_PIN, HIGH);
+    delay(500);
+    digitalWrite(RELAY_PIN, LOW);
+    last_status = 2;
+    post_status(last_status);
+    door_closing = 1;
+  } else if (millis() > buzz_start + 1000) {            // Warning Buzzer
+    if (buzz_high) {
+      digitalWrite(BUZZER_PIN, LOW);
+      buzz_high = 0;
+    } else {
+      digitalWrite(BUZZER_PIN, HIGH);
+      buzz_high = 1;
+    }
+    buzz_start = millis();
+    currstatus=get_current_status();
+    if(currstatus == 1) {
+      last_status = 1;
+      closing = buzz_high = 0;
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+  }
+}
